@@ -1,8 +1,9 @@
 # Created and maintained by: Minedient
 # GPL-3.0 License
 
+import math
 import sys, os
-from PySide6.QtWidgets import QMessageBox, QApplication, QMainWindow, QFileDialog, QLabel
+from PySide6.QtWidgets import QMessageBox, QApplication, QMainWindow, QFileDialog, QLabel, QDialog, QVBoxLayout, QComboBox, QDialogButtonBox
 from PySide6.QtCore import Slot, QTimer
 from ultralytics import YOLO
 from gui import Ui_MainDialog
@@ -32,6 +33,7 @@ CONDITIONALS = {
     4: lambda x, y: x < y,
     5: lambda x, y: x <= y
 }
+CAM_INDEX = 0 # Default camera index
 
 # Global variables
 model = None
@@ -60,8 +62,17 @@ def find_port(pid, vid, baud):
             return port
     return None
 
+def draw_box(frame, box, names):
+    x1, y1, x2, y2 = box.xyxy[0]
+    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2) # convert to int values
+    confidence = math.ceil((box.conf[0]*100))/100
+    label = names[int(box.cls)]
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 3)
+    y = y1 - 15 if y1 - 15 > 15 else y1 + 15
+    cv2.putText(frame, f"{label}: {confidence:.2f}", (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
 # Get the label counts from the results (all)
-def get_label_counts(results):
+def get_label_counts(results, frame):
     label_counts = {}
     for result in results:
         boxes = result.boxes
@@ -69,6 +80,10 @@ def get_label_counts(results):
             # if confidence is less than 0.5, ignore the box
             if box.conf[0] < 0.5:
                 continue
+
+            # Draw bounding boxes
+            draw_box(frame, box, model.names)
+
             # Get the label name
             label = model.names[int(box.cls)]
             if label in label_counts:
@@ -93,6 +108,25 @@ def counter_logic(type1Counter, type2Counter):
     else:
         type2Result = CONDITIONALS.get(r2, lambda x, y: False)(type2Counter, n2)
         return type1Result or type2Result if l == 1 else type1Result and type2Result
+
+def list_available_cameras():
+    index = 0
+    arr = []
+    while True:
+        cap = cv2.VideoCapture(index)
+        if not cap.read()[0]:
+            break
+        else:
+            arr.append(index)
+        cap.release()
+        index += 1
+    return arr
+
+def prepare_and_send_command_text(text, type1, type2, color):
+    text = text.replace("%1", str(type1)).replace("%2", str(type2))
+    window.ui.label_7.setText('發送指令：{}'.format(text))
+    window.ui.label_7.setStyleSheet("color: {}".format(color))
+    ser.write(str(text).encode())
 
 @Slot()
 def on_loadModelButton_clicked():
@@ -147,10 +181,15 @@ def start_detection():
     # Reset the flag
     end_capture = False
 
-    # Initialize the webcam
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(CAM_INDEX)
+    
+    if not cap.isOpened():
+        logging.error("無法打開選擇的攝像頭設備")
+        return
     
     logging.info("開始收集數據")
+
+    old1, old2 = 0, 0
 
     while not end_capture:
         ret, frame = cap.read()
@@ -166,21 +205,23 @@ def start_detection():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = model(rgb_frame)
 
-        label_counts = get_label_counts(results)
+        label_counts = get_label_counts(results, frame)
         type1Counter, type2Counter = label_counts.get(window.ui.typeComboBox.currentText(), 0), label_counts.get(window.ui.typeComboBox_2.currentText(), 0)
 
-        if counter_logic(type1Counter, type2Counter):
-            # Send a signal here
-            command_text = window.ui.lineEdit.text()
+        if type1Counter != old1 or type2Counter != old2:
+            # Only update if either of the counters have changed
+            if counter_logic(type1Counter, type2Counter):
+                # Send a signal here
+                prepare_and_send_command_text(window.ui.lineEdit.text(), type1Counter, type2Counter, "green")
+                #logging.info("符合條件，將會發送指令：{} 到micro:bit".format(command_text))
 
-            # Pre-process the command text
-            # Find %1 and %2 and replace them with the number1 and number2
-            command_text = command_text.replace("%1", str(type1Counter)).replace("%2", str(type2Counter))
+                # Send the command to the micro:bit
+            elif window.ui.hasNegate.isChecked():
+                #Get the command of the else condition
+                prepare_and_send_command_text(window.ui.lineEdit_2.text(), type1Counter, type2Counter, "red")
+                #logging.info("符合else條件，將會發送指令：{} 到micro:bit".format(command_text))
+            old1, old2 = type1Counter, type2Counter
 
-            logging.info("符合條件，將會發送指令：{} 到micro:bit".format(command_text))
-
-            # Send the command to the micro:bit
-            ser.write(str(command_text).encode())
 
         cv2.imshow('Video captured', frame)
     
